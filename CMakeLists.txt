@@ -1,0 +1,19 @@
+if(IDF_TARGET STREQUAL "esp32")
+    list(APPEND COMPONENT_SRCS "esp32/lcd_cam.c")
+    list(APPEND COMPONENT_PRIV_INCLUDEDIRS "esp32/include/soc")
+    list(APPEND COMPONENT_ADD_INCLUDEDIRS "esp32/include")
+endif()
+
+if(IDF_TARGET STREQUAL "esp32s2")
+    list(APPEND COMPONENT_SRCS "esp32s2/lcd_cam.c")
+    list(APPEND COMPONENT_PRIV_INCLUDEDIRS "esp32s2/include/soc")
+    list(APPEND COMPONENT_ADD_INCLUDEDIRS "esp32s2/include")
+endif()
+
+if(IDF_TARGET STREQUAL "esp32s3")
+    list(APPEND COMPONENT_SRCS "esp32s3/lcd_cam.c")
+    list(APPEND COMPONENT_PRIV_INCLUDEDIRS "esp32s3/include/soc")
+    list(APPEND COMPONENT_ADD_INCLUDEDIRS "esp32s3/include")
+endif()
+
+register_component()
