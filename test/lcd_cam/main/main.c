@@ -2,15 +2,16 @@
 #include <stdint.h>
 #include "lcd_cam.h"
 
+lcd_cam_handle_t lcd_cam;
+
 void app_main() 
 {
-    lcd_cam_handle_t lcd_cam;
     lcd_cam_config_t lcd_cam_config = {
         .lcd = {
             .en = false,
         },
         .cam = {
-            .en = true,
+            .en = false,
         }
     };
 

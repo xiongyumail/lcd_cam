@@ -7,6 +7,8 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  schedule:
+    - cron: '0 24 * * *'
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -32,7 +34,7 @@ jobs:
         ./esp-idf/install.sh
         . ./esp-idf/export.sh
         echo $PATH
-        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        cd $PROJECT_PATH/test/lcd_cam
         export TEST_PATH=$PWD
         mkdir -p components/lcd_cam
         cd components/lcd_cam
@@ -44,7 +46,7 @@ jobs:
     - uses: actions/upload-artifact@v2
       with:
         name: esp32s3_build
-        path: .github/workflows/lcd_cam/build
+        path: test/lcd_cam/build
 
   build_esp32s2:
     runs-on: ubuntu-latest
@@ -68,7 +70,7 @@ jobs:
         ./esp-idf/install.sh
         . ./esp-idf/export.sh
         echo $PATH
-        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        cd $PROJECT_PATH/test/lcd_cam
         export TEST_PATH=$PWD
         mkdir -p components/lcd_cam
         cd components/lcd_cam
@@ -80,7 +82,7 @@ jobs:
     - uses: actions/upload-artifact@v2
       with:
         name: esp32s2_build
-        path: .github/workflows/lcd_cam/build
+        path: test/lcd_cam/build
 
   build_esp32:
     runs-on: ubuntu-latest
@@ -104,7 +106,7 @@ jobs:
         ./esp-idf/install.sh
         . ./esp-idf/export.sh
         echo $PATH
-        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        cd $PROJECT_PATH/test/lcd_cam
         export TEST_PATH=$PWD
         mkdir -p components/lcd_cam
         cd components/lcd_cam
@@ -116,4 +118,4 @@ jobs:
     - uses: actions/upload-artifact@v2
       with:
         name: esp32_build
-        path: .github/workflows/lcd_cam/build
+        path: test/lcd_cam/build
