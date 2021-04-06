@@ -29,8 +29,8 @@ jobs:
         cd $PROJECT_PATH/.github/workflows
         git clone --recursive https://github.com/espressif/esp-idf
         git submodule update --init --recursive
-        ./install.sh
-        . ./export.sh
+        ./esp-idf/install.sh
+        . ./esp-idf/export.sh
         echo $PATH
         cd $PROJECT_PATH/.github/workflows/lcd_cam
         export TEST_PATH=$PWD
@@ -65,8 +65,8 @@ jobs:
         cd $PROJECT_PATH/.github/workflows
         git clone --recursive https://github.com/espressif/esp-idf
         git submodule update --init --recursive
-        ./install.sh
-        . ./export.sh
+        ./esp-idf/install.sh
+        . ./esp-idf/export.sh
         echo $PATH
         cd $PROJECT_PATH/.github/workflows/lcd_cam
         export TEST_PATH=$PWD
@@ -101,8 +101,8 @@ jobs:
         cd $PROJECT_PATH/.github/workflows
         git clone --recursive https://github.com/espressif/esp-idf
         git submodule update --init --recursive
-        ./install.sh
-        . ./export.sh
+        ./esp-idf/install.sh
+        . ./esp-idf/export.sh
         echo $PATH
         cd $PROJECT_PATH/.github/workflows/lcd_cam
         export TEST_PATH=$PWD
