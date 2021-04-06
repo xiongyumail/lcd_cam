@@ -19,22 +19,20 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp32s3/rom/lldesc.h"
-#include "esp32s3/rom/gpio.h"
-#include "driver/gpio.h"
+#include "soc/apb_ctrl_reg.h"
+#include "esp32/rom/lldesc.h"
+#include "esp32/rom/cache.h"
+#include "hal/gpio_ll.h"
+#include "driver/ledc.h"
+#include "soc/dport_access.h"
+#include "soc/dport_reg.h"
+#include "i2s_struct.h"
 #include "spi_struct.h"
-#include "gdma_struct.h"
-#include "interrupt_core0_reg.h"
-#include "system_reg.h"
-#include "lcd_cam_struct.h"
 #include "lcd_cam.h"
 
 static const char *TAG = "lcd_cam";
 
-#define LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE  (4000)
-#define LCD_CAM_DMA_MAX_NUM               (5) // Maximum number of DMA channels
-#define LCD_CAM_INTR_SOURCE               (((INTERRUPT_CORE0_LCD_CAM_INT_MAP_REG - DR_REG_INTERRUPT_CORE0_BASE) / 4))
-#define DMA_CH0_INTR_SOURCE               (((INTERRUPT_CORE0_DMA_CH0_INT_MAP_REG - DR_REG_INTERRUPT_CORE0_BASE) / 4))
+#define LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE  (4000) // 4-byte aligned
 
 typedef enum {
     CAM_IN_SUC_EOF_EVENT = 0,
@@ -60,7 +58,8 @@ typedef struct {
     lldesc_t *dma;
     uint8_t  *dma_buffer;
     QueueHandle_t event_queue;
-    uint8_t  width;
+    uint8_t width;
+    uint8_t fifo_mode;
     bool swap_data;
 } lcd_obj_t;
 
@@ -90,23 +89,43 @@ typedef struct {
     bool cam_en;
     lcd_obj_t lcd;
     cam_obj_t cam;
-    uint8_t dma_num;
     intr_handle_t lcd_cam_intr_handle;
-    intr_handle_t dma_intr_handle;
+    intr_handle_t spi_intr_handle;
 } lcd_cam_obj_t;
 
 static lcd_cam_obj_t *lcd_cam_obj = NULL;
 
-static void IRAM_ATTR lcd_cam_isr(void *arg)
+static void IRAM_ATTR i2s_isr(void *arg)
 {
     cam_event_t cam_event = {0};
-    typeof(LCD_CAM.lc_dma_int_st) status = LCD_CAM.lc_dma_int_st;
     BaseType_t HPTaskAwoken = pdFALSE;
+    typeof(I2S0.int_st) status = I2S0.int_st;
+    I2S0.int_clr.val = status.val;
     if (status.val == 0) {
         return;
     }
-    LCD_CAM.lc_dma_int_clr.val = status.val;
-    if (status.cam_vsync) {
+
+    if (status.out_eof) {
+        xQueueSendFromISR(lcd_cam_obj->lcd.event_queue, &status.val, &HPTaskAwoken);
+    }
+
+    if (status.in_suc_eof) {
+        cam_event = CAM_IN_SUC_EOF_EVENT;
+        xQueueSendFromISR(lcd_cam_obj->cam.event_queue, (void *)&cam_event, &HPTaskAwoken);
+    }
+
+    if (HPTaskAwoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void IRAM_ATTR cam_vsync_isr(void *arg)
+{
+    cam_event_t cam_event = {0};
+    BaseType_t HPTaskAwoken = pdFALSE;
+    // filter
+    esp_rom_delay_us(1);
+    if (gpio_ll_get_level(&GPIO, lcd_cam_obj->cam.vsync_pin) == !lcd_cam_obj->cam.vsync_invert) {
         cam_event = CAM_VSYNC_EVENT;
         xQueueSendFromISR(lcd_cam_obj->cam.event_queue, (void *)&cam_event, &HPTaskAwoken);
     }
@@ -116,26 +135,21 @@ static void IRAM_ATTR lcd_cam_isr(void *arg)
     }
 }
 
-static void IRAM_ATTR dma_isr(void *arg)
+static void IRAM_ATTR spi_isr(void *arg)
 {
-    cam_event_t cam_event = {0};
+    int event;
     BaseType_t HPTaskAwoken = pdFALSE;
-    typeof(GDMA.int_st[lcd_cam_obj->dma_num]) status = GDMA.int_st[lcd_cam_obj->dma_num];
+    typeof(SPI3.dma_int_st) status = SPI3.dma_int_st;
+    SPI3.dma_int_clr.val = status.val;
     if (status.val == 0) {
         return;
-    }
-    GDMA.int_clr[lcd_cam_obj->dma_num].val = status.val;
-    // handle RX interrupt */
-    if (status.in_suc_eof) {
-        cam_event = CAM_IN_SUC_EOF_EVENT;
-        xQueueSendFromISR(lcd_cam_obj->cam.event_queue, (void *)&cam_event, &HPTaskAwoken);
     }
 
     if (status.out_eof) {
         xQueueSendFromISR(lcd_cam_obj->lcd.event_queue, &status.val, &HPTaskAwoken);
     }
 
-    if(HPTaskAwoken == pdTRUE) {
+    if (HPTaskAwoken == pdTRUE) {
         portYIELD_FROM_ISR();
     }
 }
@@ -172,23 +186,24 @@ static void lcd_dma_set_left(int pos, size_t len)
     lcd_cam_obj->lcd.dma[end_pos].empty = NULL;
 }
 
-static void lcd_start(uint32_t addr, size_t len)
+static void i2s_start(uint32_t addr, size_t len)
 {
-    LCD_CAM.lcd_user.lcd_start = 0;
-    LCD_CAM.lcd_user.lcd_reset = 1;
-    LCD_CAM.lcd_user.lcd_reset = 0;
-    LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
-    LCD_CAM.lcd_misc.lcd_afifo_reset = 0;
-    GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 1;
-    GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 0;
-    GDMA.out_link[lcd_cam_obj->dma_num].addr = addr;
-    GDMA.out_link[lcd_cam_obj->dma_num].start = 1;
+    while (!I2S0.state.tx_idle);
+    I2S0.fifo_conf.tx_fifo_mod = lcd_cam_obj->lcd.fifo_mode;
+    I2S0.conf.tx_start = 0;
+    I2S0.conf.tx_reset = 1;
+    I2S0.conf.tx_reset = 0;
+    I2S0.lc_conf.out_rst = 1;
+    I2S0.lc_conf.out_rst = 0;
+    I2S0.conf.tx_fifo_reset = 1;
+    I2S0.conf.tx_fifo_reset = 0;
+    I2S0.out_link.addr = addr;
+    I2S0.out_link.start = 1;
     esp_rom_delay_us(1);
-    LCD_CAM.lcd_user.lcd_update = 1;
-    LCD_CAM.lcd_user.lcd_start = 1;
+    I2S0.conf.tx_start = 1;
 }
 
-static void lcd_write_data(uint8_t *data, size_t len)
+static void i2s_write_8bit_data(uint8_t *data, size_t len)
 {
     int event  = 0;
     int x = 0, y = 0, left = 0, cnt = 0;
@@ -196,78 +211,167 @@ static void lcd_write_data(uint8_t *data, size_t len)
         ESP_LOGE(TAG, "wrong len!");
         return;
     }
+    len = len * 2;
     lcd_dma_set_int();
-    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
+    lcd_cam_obj->lcd.fifo_mode = 1;
     // Start signal
     xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
+    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
     // Process a complete piece of data, ping-pong operation
     for (x = 0; x < cnt; x++) {
         uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
         uint8_t *in  = data;
         if (lcd_cam_obj->lcd.swap_data) {
-            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=2) {
-                out[y+1] = in[y+0];
-                out[y+0] = in[y+1];
+            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=4) {
+                out[y+3] = in[(y>>1)+0];
+                out[y+1] = in[(y>>1)+1];
             }
         } else {
-            memcpy(out, in, lcd_cam_obj->lcd.dma_half_buffer_size);
+            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=4) {
+                out[y+1] = in[(y>>1)+0];
+                out[y+3] = in[(y>>1)+1];
+            }
         }
-        data += lcd_cam_obj->lcd.dma_half_buffer_size;
+        data += lcd_cam_obj->lcd.dma_half_buffer_size >> 1;
         xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
-        lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, lcd_cam_obj->lcd.dma_half_buffer_size);
+        i2s_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, lcd_cam_obj->lcd.dma_half_buffer_size);
     }
     left = len % lcd_cam_obj->lcd.dma_half_buffer_size;
     // Process remaining incomplete segment data
-    if (left) {
+    while (left) {
         uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
         uint8_t *in  = data;
-        cnt = left - left % 2;
-        if (cnt) {
+        if (left > 2) {
+            cnt = left - left % 4;
+            left = left % 4;
+            data += cnt >> 1;
             if (lcd_cam_obj->lcd.swap_data) {
-                for (y = 0; y < cnt; y+=2) {
-                    out[y+1] = in[y+0];
-                    out[y+0] = in[y+1];
+                for (y = 0; y < cnt; y+=4) {
+                    out[y+3] = in[(y>>1)+0];
+                    out[y+1] = in[(y>>1)+1];
                 }
             } else {
-                memcpy(out, in, cnt);
+                for (y = 0; y < cnt; y+=4) {
+                    out[y+1] = in[(y>>1)+0];
+                    out[y+3] = in[(y>>1)+1];
+                }
             }
+        } else {
+            cnt = 4;
+            left = 0;
+            lcd_cam_obj->lcd.fifo_mode = 3;
+            out[3] = in[0];
         }
-
-        if (left % 2) {
-            out[cnt] = in[cnt];
-        }
-        lcd_dma_set_left(x, left);
+        lcd_dma_set_left(x, cnt);
         xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
-        lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, left);
+        i2s_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, cnt);
+        x++;
     }
     xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+    while (!I2S0.state.tx_idle);
+}
+
+static void i2s_write_16bit_data(uint8_t *data, size_t len)
+{
+    int event  = 0;
+    int x = 0, y = 0, left = 0, cnt = 0;
+    if (len <= 0 || len % 2 != 0) {
+        ESP_LOGE(TAG, "wrong len!");
+        return;
+    }
+    lcd_dma_set_int();
+    lcd_cam_obj->lcd.fifo_mode = 1;
+    // Start signal
+    xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
+    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
+    // Process a complete piece of data, ping-pong operation
+    for (x = 0; x < cnt; x++) {
+        uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
+        uint8_t *in  = data;
+        if (lcd_cam_obj->lcd.swap_data) {
+            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=4) {
+                out[y+3] = in[y+0];
+                out[y+2] = in[y+1];
+                out[y+1] = in[y+2];
+                out[y+0] = in[y+3];
+            }
+        } else {
+            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=4) {
+                out[y+2] = in[y+0];
+                out[y+3] = in[y+1];
+                out[y+0] = in[y+2];
+                out[y+1] = in[y+3];
+            }
+        }     
+        data += lcd_cam_obj->lcd.dma_half_buffer_size;
+        xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+        i2s_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, lcd_cam_obj->lcd.dma_half_buffer_size);
+    }
+    left = len % lcd_cam_obj->lcd.dma_half_buffer_size;
+    // Process remaining incomplete segment data
+    while (left) {
+        uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
+        uint8_t *in = data;
+        if (left > 2) {
+            cnt = left - left % 4;
+            left = left % 4;
+            data += cnt;
+            if (lcd_cam_obj->lcd.swap_data) {
+                for (y = 0; y < cnt; y+=4) {
+                    out[y+3] = in[y+0];
+                    out[y+2] = in[y+1];
+                    out[y+1] = in[y+2];
+                    out[y+0] = in[y+3];
+                }
+            } else {
+                for (y = 0; y < cnt; y+=4) {
+                    out[y+2] = in[y+0];
+                    out[y+3] = in[y+1];
+                    out[y+0] = in[y+2];
+                    out[y+1] = in[y+3];
+                }
+            } 
+        } else {
+            cnt = 4;
+            left = 0;
+            lcd_cam_obj->lcd.fifo_mode = 3;
+            if (lcd_cam_obj->lcd.swap_data) {
+                out[3] = in[0];
+                out[2] = in[1];
+            } else {
+                out[2] = in[0];
+                out[3] = in[1];
+            }
+        }
+        lcd_dma_set_left(x, cnt);
+        xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+        i2s_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, cnt);
+        x++;
+    }
+    xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+    while (!I2S0.state.tx_idle);
 }
 
 static void spi_start(uint32_t addr, size_t len)
 {
-    GPSPI3.cmd.usr = 0;
-    GPSPI3.ms_dlen.ms_data_bitlen = len * 8 - 1;
-    GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 1;
-    GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 0;
-    GDMA.out_link[lcd_cam_obj->dma_num].addr = addr;
-    GDMA.out_link[lcd_cam_obj->dma_num].start = 1;
-    GPSPI3.cmd.update = 1;
-    while (GPSPI3.cmd.update);
-    GPSPI3.cmd.usr = 1;
+    SPI3.mosi_dlen.usr_mosi_dbitlen = len * 8 - 1;
+    SPI3.dma_out_link.addr = addr;
+    SPI3.dma_out_link.start = 1;
+    esp_rom_delay_us(1);
+    SPI3.cmd.usr = 1;
 }
 
 static void spi_write_data(uint8_t *data, size_t len)
 {
     int event  = 0;
-    int x = 0, y = 0, left = 0, cnt = 0;
+    int x = 0, y = 0, cnt = 0, left = 0;
     if (len <= 0) {
-        ESP_LOGE(TAG, "wrong len!");
         return;
     }
     lcd_dma_set_int();
-    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
     // Start signal
     xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
+    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
     // Process a complete piece of data, ping-pong operation
     for (x = 0; x < cnt; x++) {
         uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
@@ -318,138 +422,138 @@ static void lcd_swap_data(bool en)
 
 static esp_err_t lcd_cam_config(lcd_cam_config_t *config)
 {
-    GDMA.conf0[lcd_cam_obj->dma_num].val = 0;
-    GDMA.conf0[lcd_cam_obj->dma_num].mem_trans_en = 0;
-    GDMA.conf1[lcd_cam_obj->dma_num].val = 0;
-    GDMA.conf1[lcd_cam_obj->dma_num].check_owner = 0;
-    GDMA.int_clr[lcd_cam_obj->dma_num].val = ~0;
-    GDMA.int_ena[lcd_cam_obj->dma_num].val = 0;
+   // Configure the clock
+    I2S0.clkm_conf.clkm_div_num = 2; // 160MHz / 2 = 80MHz
+    I2S0.clkm_conf.clkm_div_b = 0;
+    I2S0.clkm_conf.clkm_div_a = 10;
+    I2S0.clkm_conf.clk_en = 1;
+
+    I2S0.conf.val = 0;
+    I2S0.fifo_conf.val = 0;
+    I2S0.fifo_conf.dscr_en = 1;
+
+    I2S0.conf2.lcd_en = 1;
+    I2S0.conf2.camera_en = 1;
+
+    I2S0.lc_conf.ahbm_fifo_rst = 1;
+    I2S0.lc_conf.ahbm_fifo_rst = 0;
+    I2S0.lc_conf.ahbm_rst = 1;
+    I2S0.lc_conf.ahbm_rst = 0;
+    I2S0.lc_conf.check_owner = 0;
+    I2S0.lc_conf.out_loop_test = 0;
+    I2S0.lc_conf.out_auto_wrback = 0;
+    I2S0.lc_conf.out_data_burst_en = 1;
+    I2S0.lc_conf.out_no_restart_clr = 0;
+    I2S0.lc_conf.indscr_burst_en = 0;
+    I2S0.lc_conf.out_eof_mode = 1;
+
+    I2S0.timing.val = 0;
+
+    I2S0.int_ena.val = 0;
+    I2S0.int_clr.val = ~0;
 
     if (lcd_cam_obj->lcd_en) {
         if (config->lcd.width == 1) { // SPI mode
-            GPSPI3.clk_gate.clk_en = 1;
-            GPSPI3.clk_gate.mst_clk_active = 1;
-            GPSPI3.clk_gate.mst_clk_sel = 1;
-
             int div = 2;
-            if (config->lcd.fre >= 80000000) {
-                GPSPI3.clock.clk_equ_sysclk = 1;
+            if (config->lcd.fre == 80000000) {
+                SPI3.clock.clk_equ_sysclk = 1;
             } else {
-                GPSPI3.clock.clk_equ_sysclk = 0;
+                SPI3.clock.clk_equ_sysclk = 0;
                 div = 80000000 / config->lcd.fre;
             }
-            GPSPI3.slave.clk_mode = 0;
-            GPSPI3.clock.clkdiv_pre = 1 - 1;
-            GPSPI3.clock.clkcnt_n = div - 1;
-            GPSPI3.clock.clkcnt_l = div - 1;
-            GPSPI3.clock.clkcnt_h = ((div >> 1) - 1);
+            SPI3.clock.clkdiv_pre = 1 - 1;
+            SPI3.clock.clkcnt_n = div - 1;
+            SPI3.clock.clkcnt_l = div - 1;
+            SPI3.clock.clkcnt_h = ((div >> 1) - 1);
             
-            GPSPI3.misc.ck_dis = 0;
+            SPI3.pin.ck_dis = 0;
 
-            GPSPI3.user1.val = 0;
-            GPSPI3.slave.val = 0;
-            GPSPI3.misc.ck_idle_edge = 0;
-            GPSPI3.user.ck_out_edge = 0;
-            GPSPI3.ctrl.wr_bit_order = 0;
-            GPSPI3.ctrl.rd_bit_order = 0;
-            GPSPI3.user.val = 0;
-            GPSPI3.user.cs_setup = 1;
-            GPSPI3.user.cs_hold = 1;
-            GPSPI3.user.usr_mosi = 1;
-            GPSPI3.user.usr_mosi_highpart = 0;
-            GPSPI3.dma_conf.val = 0;
-            GPSPI3.dma_conf.dma_tx_ena = 1;
-            GPSPI3.dma_conf.tx_seg_trans_clr_en = 1;
-            GPSPI3.dma_conf.dma_seg_trans_en = 0;
-            
-            GPSPI3.dma_conf.dma_afifo_rst = 1;
-            GPSPI3.dma_conf.dma_afifo_rst = 0;
-            GPSPI3.dma_conf.buf_afifo_rst = 1;
-            GPSPI3.dma_conf.buf_afifo_rst = 0;
+            SPI3.user1.val = 0;
+            SPI3.slave.val = 0;
+            SPI3.pin.ck_idle_edge = 0;
+            SPI3.user.ck_out_edge = 0;
+            SPI3.ctrl.wr_bit_order = 0;
+            SPI3.ctrl.rd_bit_order = 0;
+            SPI3.user.val = 0;
+            SPI3.user.cs_setup = 1;
+            SPI3.user.cs_hold = 1;
+            SPI3.user.usr_mosi = 1;
+            SPI3.user.usr_mosi_highpart = 0;
 
-            GPSPI3.cmd.update = 1;
-            while (GPSPI3.cmd.update);
-            GPSPI3.cmd.usr = 0;
+            SPI3.dma_conf.val = 0;
+            SPI3.dma_conf.out_rst = 1;
+            SPI3.dma_conf.out_rst = 0;
+            SPI3.dma_conf.ahbm_fifo_rst = 1;
+            SPI3.dma_conf.ahbm_fifo_rst = 0;
+            SPI3.dma_conf.ahbm_rst = 1;
+            SPI3.dma_conf.ahbm_rst = 0;
+            SPI3.dma_conf.out_eof_mode = 1;
+            SPI3.cmd.usr = 0;
+
+            SPI3.dma_int_clr.val = ~0;
+            SPI3.dma_int_ena.out_eof = 1;
         } else {
-            LCD_CAM.lcd_clock.val = 0;
-            LCD_CAM.lcd_clock.clk_en = 1;
-            LCD_CAM.lcd_clock.lcd_clk_sel = 3;
-            LCD_CAM.lcd_clock.lcd_clkm_div_b = 0;
-            LCD_CAM.lcd_clock.lcd_clkm_div_a = 10;
-            LCD_CAM.lcd_clock.lcd_clkm_div_num = 2;
-            LCD_CAM.lcd_clock.lcd_clkcnt_n = 80000000 / config->lcd.fre - 1;
-            LCD_CAM.lcd_clock.lcd_clk_equ_sysclk = 0;
-            LCD_CAM.lcd_clock.lcd_ck_idle_edge = 1; // After lcd_clk_equ_sysclk is set to 1, this bit has no effect
-            LCD_CAM.lcd_clock.lcd_ck_out_edge = 0; // After lcd_clk_equ_sysclk is set to 1, this bit has no effect
-            LCD_CAM.lcd_user.val = 0;
-            LCD_CAM.lcd_user.lcd_2byte_en = (config->lcd.width == 16) ? 1 : 0;
-            LCD_CAM.lcd_user.lcd_byte_order = 0;
-            LCD_CAM.lcd_user.lcd_bit_order = 0;
-            LCD_CAM.lcd_user.lcd_cmd = 0;		// FSM CMD phase
-            LCD_CAM.lcd_user.lcd_cmd_2_cycle_en = 0;	// 2 cycle command
-            LCD_CAM.lcd_user.lcd_dout = 1;	// FSM DOUT phase
-            LCD_CAM.lcd_user.lcd_dout_cyclelen = 2 - 1;
-            LCD_CAM.lcd_user.lcd_8bits_order = 1;
-            LCD_CAM.lcd_user.lcd_always_out_en = 1;
-            LCD_CAM.lcd_misc.val = 0;
-            LCD_CAM.lcd_misc.lcd_afifo_threshold_num = 11;
-            LCD_CAM.lcd_misc.lcd_vfk_cyclelen = 3;
-            LCD_CAM.lcd_misc.lcd_vbk_cyclelen = 0;
-            LCD_CAM.lcd_misc.lcd_cd_idle_edge = 1;	// idle edge of CD is set to 0
-            LCD_CAM.lcd_misc.lcd_cd_cmd_set = 1;
-            LCD_CAM.lcd_misc.lcd_cd_dummy_set = 0;
-            LCD_CAM.lcd_misc.lcd_cd_data_set = 0;	// change when DOUT start
-            LCD_CAM.lcd_misc.lcd_bk_en = 1;
-            LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
-            LCD_CAM.lcd_misc.lcd_afifo_reset = 0;
-            LCD_CAM.lcd_ctrl.val = 0;
-            LCD_CAM.lcd_ctrl.lcd_rgb_mode_en = 0;
-            LCD_CAM.lcd_cmd_val = 0;	// write command
-            LCD_CAM.lcd_user.lcd_update = 1;
-        }
+            // Configure sampling rate
+            I2S0.sample_rate_conf.tx_bck_div_num = 40000000 / config->lcd.fre; // Fws = Fbck / 2
+            I2S0.sample_rate_conf.tx_bits_mod = (config->lcd.width == 8) ? 0 : 1;
+            // Configuration data format
+            I2S0.conf.tx_start = 0;
+            I2S0.conf.tx_reset = 1;
+            I2S0.conf.tx_reset = 0;
+            I2S0.conf.tx_fifo_reset = 1;
+            I2S0.conf.tx_fifo_reset = 0;
+            I2S0.conf.tx_slave_mod = 0;
+            I2S0.conf.tx_right_first = 1; // Must be set to 1, otherwise the clock line will change during reset
+            I2S0.conf.tx_msb_right = 0;
+            I2S0.conf.tx_short_sync = 0;
+            I2S0.conf.tx_mono = 0;
+            I2S0.conf.tx_msb_shift = 0;
 
-        GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 1;
-        GDMA.conf0[lcd_cam_obj->dma_num].out_rst = 0;
-        GDMA.conf0[lcd_cam_obj->dma_num].outdscr_burst_en = 1;
-        GDMA.conf0[lcd_cam_obj->dma_num].out_data_burst_en = 1;
-        GDMA.peri_sel[lcd_cam_obj->dma_num].peri_out_sel = (config->lcd.width == 1) ? 1 : 5;
-        GDMA.pri[lcd_cam_obj->dma_num].tx_pri = 1;
-        GDMA.int_ena[lcd_cam_obj->dma_num].out_eof = 1;
+            I2S0.conf1.tx_pcm_bypass = 1;
+            I2S0.conf1.tx_stop_en = 1;
+
+            I2S0.conf_chan.tx_chan_mod = 1;
+
+            I2S0.fifo_conf.tx_fifo_mod_force_en = 1;
+            I2S0.fifo_conf.tx_data_num = 32;
+            I2S0.fifo_conf.tx_fifo_mod = 1;
+
+            I2S0.lc_conf.out_rst  = 1;
+            I2S0.lc_conf.out_rst  = 0;
+
+            I2S0.int_ena.out_eof = 1;
+        }
     }
 
     if (lcd_cam_obj->cam_en) {
-        LCD_CAM.cam_ctrl.val = 0;
-        LCD_CAM.cam_ctrl.cam_clkm_div_b = 0;
-        LCD_CAM.cam_ctrl.cam_clkm_div_a = 10;
-        LCD_CAM.cam_ctrl.cam_clkm_div_num = 160000000 / config->cam.fre;
-        LCD_CAM.cam_ctrl.cam_clk_sel = 3;
-        LCD_CAM.cam_ctrl.cam_stop_en = 0;
-        LCD_CAM.cam_ctrl.cam_vsync_filter_thres = 7 - 1; // Filter by LCD_CAM clock
-        LCD_CAM.cam_ctrl.cam_update = 0;
-        LCD_CAM.cam_ctrl.cam_byte_order = 0;
-        LCD_CAM.cam_ctrl.cam_bit_order = 0; 
-        LCD_CAM.cam_ctrl.cam_line_int_en = 0;
-        LCD_CAM.cam_ctrl.cam_vs_eof_en = 0; // in_suc_eof interrupt generation method
-        LCD_CAM.cam_ctrl1.val = 0;
-        LCD_CAM.cam_ctrl1.cam_rec_data_bytelen = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1; // Cannot be assigned to 0, and it is easy to overflow
-        LCD_CAM.cam_ctrl1.cam_line_int_num = 1  - 1; // The number of hsyncs that generate hs interrupts
-        LCD_CAM.cam_ctrl1.cam_clk_inv = 0;
-        LCD_CAM.cam_ctrl1.cam_vsync_filter_en = 1;
-        LCD_CAM.cam_ctrl1.cam_2byte_en = 0;
-        LCD_CAM.cam_ctrl1.cam_de_inv = 0;
-        LCD_CAM.cam_ctrl1.cam_hsync_inv = 0;
-        LCD_CAM.cam_ctrl1.cam_vsync_inv = 0;
-        LCD_CAM.cam_ctrl1.cam_vh_de_mode_en = 0;
+        // Configure sampling rate
+        I2S0.sample_rate_conf.rx_bck_div_num = 1;
+        I2S0.sample_rate_conf.rx_bits_mod = (config->cam.width == 8) ? 0 : 1;
+        // Configuration data format
+        I2S0.conf.rx_start = 0;
+        I2S0.conf.rx_reset = 1;
+        I2S0.conf.rx_reset = 0;
+        I2S0.conf.rx_fifo_reset = 1;
+        I2S0.conf.rx_fifo_reset = 0;
+        I2S0.conf.rx_slave_mod = 1;
+        I2S0.conf.rx_right_first = 0;
+        I2S0.conf.rx_msb_right = 0;
+        I2S0.conf.rx_short_sync = 0;
+        I2S0.conf.rx_mono = 0;
+        I2S0.conf.rx_msb_shift = 0;
 
-        GDMA.conf0[lcd_cam_obj->dma_num].in_rst = 1;
-        GDMA.conf0[lcd_cam_obj->dma_num].in_rst = 0;
-        GDMA.conf0[lcd_cam_obj->dma_num].indscr_burst_en = 1;
-        GDMA.conf0[lcd_cam_obj->dma_num].in_data_burst_en = 1;
-        GDMA.peri_sel[lcd_cam_obj->dma_num].peri_in_sel = 5;
-        GDMA.pri[lcd_cam_obj->dma_num].rx_pri = 1;
+        I2S0.conf1.rx_pcm_bypass = 1;
 
-        LCD_CAM.cam_ctrl.cam_update = 1;
-        LCD_CAM.cam_ctrl1.cam_start = 1;
+        I2S0.conf_chan.rx_chan_mod = 1;
+
+        I2S0.fifo_conf.rx_fifo_mod_force_en = 1;
+        I2S0.fifo_conf.rx_data_num = 32;
+        I2S0.fifo_conf.rx_fifo_mod = 1;
+
+        I2S0.lc_conf.in_rst  = 1;
+        I2S0.lc_conf.in_rst  = 0;
+
+        I2S0.conf.rx_start = 1;
     }
     return ESP_OK;
 }
@@ -460,23 +564,24 @@ static esp_err_t lcd_set_pin(lcd_config_t *config)
         PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.clk], PIN_FUNC_GPIO);
         gpio_set_direction(config->pin.clk, GPIO_MODE_OUTPUT);
         gpio_set_pull_mode(config->pin.clk, GPIO_FLOATING);
-        gpio_matrix_out(config->pin.clk, SPI3_CLK_OUT_IDX, config->invert.clk, false);
+        gpio_matrix_out(config->pin.clk, VSPICLK_OUT_IDX, config->invert.clk, false);
 
         PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.data[0]], PIN_FUNC_GPIO);
         gpio_set_direction(config->pin.data[0], GPIO_MODE_OUTPUT);
         gpio_set_pull_mode(config->pin.data[0], GPIO_FLOATING);
-        gpio_matrix_out(config->pin.data[0], SPI3_D_OUT_IDX, config->invert.data[0], false);
+        gpio_matrix_out(config->pin.data[0], VSPID_OUT_IDX, config->invert.data[0], false);
     } else if (config->width <= LCD_DATA_MAX_WIDTH && config->width % 8 == 0){
         PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.clk], PIN_FUNC_GPIO);
         gpio_set_direction(config->pin.clk, GPIO_MODE_OUTPUT);
         gpio_set_pull_mode(config->pin.clk, GPIO_FLOATING);
-        gpio_matrix_out(config->pin.clk, LCD_PCLK_IDX, config->invert.clk, false);
+        gpio_matrix_out(config->pin.clk, I2S0O_WS_OUT_IDX, !config->invert.clk, false);
 
         for(int i = 0; i < config->width; i++) {
             PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.data[i]], PIN_FUNC_GPIO);
             gpio_set_direction(config->pin.data[i], GPIO_MODE_OUTPUT);
             gpio_set_pull_mode(config->pin.data[i], GPIO_FLOATING);
-            gpio_matrix_out(config->pin.data[i], LCD_DATA_OUT0_IDX + i, config->invert.data[i], false);
+            // High bit aligned, OUT23 is always the highest bit
+            gpio_matrix_out(config->pin.data[i], I2S0O_DATA_OUT0_IDX + (LCD_DATA_MAX_WIDTH - config->width) + i, config->invert.data[i], false);
         }
     } else {
         ESP_LOGE(TAG, "lcd width wrong!");
@@ -489,13 +594,8 @@ static esp_err_t lcd_dma_config(lcd_config_t *config)
 {
     int cnt = 0;
     if (LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE % 2 != 0) {
-         ESP_LOGE(TAG, "need 2-byte aligned data length");
+         ESP_LOGE(TAG, "ESP32 only supports 2-byte aligned data length");
          return ESP_FAIL;
-    }
-    if (config->width == 1) {
-        if (config->max_dma_buffer_size > 65536) {
-            config->max_dma_buffer_size = 65536;
-        }
     }
     if (config->max_dma_buffer_size >= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE * 2) {
         lcd_cam_obj->lcd.dma_node_buffer_size = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
@@ -511,56 +611,57 @@ static esp_err_t lcd_dma_config(lcd_config_t *config)
     }
     
     lcd_cam_obj->lcd.dma_half_buffer_size = lcd_cam_obj->lcd.dma_buffer_size / 2;
-
     lcd_cam_obj->lcd.dma_node_cnt = (lcd_cam_obj->lcd.dma_buffer_size) / lcd_cam_obj->lcd.dma_node_buffer_size; // Number of DMA nodes
     lcd_cam_obj->lcd.dma_half_node_cnt = lcd_cam_obj->lcd.dma_node_cnt / 2;
 
     ESP_LOGI(TAG, "lcd_buffer_size: %d, lcd_dma_size: %d, lcd_dma_node_cnt: %d\n", lcd_cam_obj->lcd.dma_buffer_size, lcd_cam_obj->lcd.dma_node_buffer_size, lcd_cam_obj->lcd.dma_node_cnt);
 
-    lcd_cam_obj->lcd.dma    = (lldesc_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_node_cnt * sizeof(lldesc_t), MALLOC_CAP_DMA);
-    lcd_cam_obj->lcd.dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_buffer_size * sizeof(uint8_t), MALLOC_CAP_DMA);
+    lcd_cam_obj->lcd.dma    = (lldesc_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_node_cnt * sizeof(lldesc_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lcd_cam_obj->lcd.dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_buffer_size * sizeof(uint8_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     return ESP_OK;
 }
 
 static void cam_vsync_intr_enable(bool en)
 {
-    LCD_CAM.lc_dma_int_clr.cam_vsync = 1;
     if (en) {
-        LCD_CAM.lc_dma_int_ena.cam_vsync = 1;
+        gpio_intr_enable(lcd_cam_obj->cam.vsync_pin);
     } else {
-        LCD_CAM.lc_dma_int_ena.cam_vsync = 0;
+        gpio_intr_disable(lcd_cam_obj->cam.vsync_pin);
     }
 }
 
 static void cam_dma_stop(void)
 {
-    if (GDMA.int_ena[lcd_cam_obj->dma_num].in_suc_eof == 1) {
-        GDMA.int_ena[lcd_cam_obj->dma_num].in_suc_eof = 0;
-        GDMA.int_clr[lcd_cam_obj->dma_num].in_suc_eof = 1;
-        GDMA.in_link[lcd_cam_obj->dma_num].stop = 1;
-        LCD_CAM.cam_ctrl.cam_update = 1;
+    if (I2S0.int_ena.in_suc_eof == 1) {
+        I2S0.conf.rx_start = 0;
+        I2S0.int_ena.in_suc_eof = 0;
+        I2S0.int_clr.in_suc_eof = 1;
+        I2S0.in_link.stop = 1;
     }
 }
 
 static void cam_dma_start(void)
 {
-    if (GDMA.int_ena[lcd_cam_obj->dma_num].in_suc_eof == 0) {
-        LCD_CAM.cam_ctrl1.cam_start = 0;
-        GDMA.int_clr[lcd_cam_obj->dma_num].in_suc_eof = 1;
-        GDMA.int_ena[lcd_cam_obj->dma_num].in_suc_eof = 1;
-        LCD_CAM.cam_ctrl1.cam_reset = 1;
-        LCD_CAM.cam_ctrl1.cam_reset = 0;
-        LCD_CAM.cam_ctrl1.cam_afifo_reset = 1;
-        LCD_CAM.cam_ctrl1.cam_afifo_reset = 0;
-        GDMA.conf0[lcd_cam_obj->dma_num].in_rst = 1;
-        GDMA.conf0[lcd_cam_obj->dma_num].in_rst = 0;
-        GDMA.in_link[lcd_cam_obj->dma_num].start = 1;
-        LCD_CAM.cam_ctrl.cam_update = 1;
-        LCD_CAM.cam_ctrl1.cam_start = 1;
+    if (I2S0.int_ena.in_suc_eof == 0) {
+        I2S0.conf.rx_start = 0;
+        I2S0.int_clr.in_suc_eof = 1;
+        I2S0.int_ena.in_suc_eof = 1;
+        I2S0.conf.rx_reset = 1;
+        I2S0.conf.rx_reset = 0;
+        I2S0.conf.rx_fifo_reset = 1;
+        I2S0.conf.rx_fifo_reset = 0;
+        I2S0.lc_conf.in_rst = 1;
+        I2S0.lc_conf.in_rst = 0;
+        I2S0.lc_conf.ahbm_fifo_rst = 1;
+        I2S0.lc_conf.ahbm_fifo_rst = 0;
+        I2S0.lc_conf.ahbm_rst = 1;
+        I2S0.lc_conf.ahbm_rst = 0;
+        I2S0.in_link.start = 1;
+        I2S0.conf.rx_start = 1;
         if(lcd_cam_obj->cam.jpeg_mode) {
             // Vsync the first frame manually
-            gpio_matrix_in(lcd_cam_obj->cam.vsync_pin, CAM_V_SYNC_IDX, !lcd_cam_obj->cam.vsync_invert);
-            gpio_matrix_in(lcd_cam_obj->cam.vsync_pin, CAM_V_SYNC_IDX, lcd_cam_obj->cam.vsync_invert);
+            gpio_matrix_in(lcd_cam_obj->cam.vsync_pin, I2S0I_V_SYNC_IDX, lcd_cam_obj->cam.vsync_invert);
+            gpio_matrix_in(lcd_cam_obj->cam.vsync_pin, I2S0I_V_SYNC_IDX, !lcd_cam_obj->cam.vsync_invert);
         }
     }
 }
@@ -579,20 +680,19 @@ static void cam_start(void)
 static void cam_memcpy(uint8_t *out, uint8_t *in, size_t len) 
 {
     if (lcd_cam_obj->cam.swap_data) {
-        int cnt = len - len % 2;
-        for (int x = 0; x < cnt; x += 2) {
-            out[x + 1] = in[x + 0];
-            out[x + 0] = in[x + 1];
-        }
-        if (len % 2) {
-            out[cnt] = in[cnt];
+        for (int x = 0; x < len; x += 4) {
+            out[(x >> 1) + 0] = in[x + 1];
+            out[(x >> 1) + 1] = in[x + 3];
         }
     } else {
-        memcpy(out, in, len);
+        for (int x = 0; x < len; x += 4) {
+            out[(x >> 1) + 1] = in[x + 1];
+            out[(x >> 1) + 0] = in[x + 3];
+        }
     }  
 }
 
-// Copy fram from DMA dma_buffer to fram dma_buffer
+//Copy fram from DMA dma_buffer to fram dma_buffer
 static void cam_task(void *arg)
 {
     int cnt = 0;
@@ -625,8 +725,7 @@ static void cam_task(void *arg)
                     if (cnt == 0) {
                         cam_vsync_intr_enable(true); // Need to start cam to receive the first buf data and then turn on the vsync interrupt
                     }
-                    cam_memcpy(&lcd_cam_obj->cam.frame_buffer[(frame_pos * lcd_cam_obj->cam.recv_size) + cnt * lcd_cam_obj->cam.dma_half_buffer_size], &lcd_cam_obj->cam.dma_buffer[(cnt % 2) * lcd_cam_obj->cam.dma_half_buffer_size], lcd_cam_obj->cam.dma_half_buffer_size);
-
+                    cam_memcpy(&lcd_cam_obj->cam.frame_buffer[(frame_pos * lcd_cam_obj->cam.recv_size) + cnt * (lcd_cam_obj->cam.dma_half_buffer_size>>1)], &lcd_cam_obj->cam.dma_buffer[(cnt % 2) * lcd_cam_obj->cam.dma_half_buffer_size], lcd_cam_obj->cam.dma_half_buffer_size);
                     if(lcd_cam_obj->cam.jpeg_mode) {
                         if (lcd_cam_obj->cam.frame_en[frame_pos] == 0) {
                             cam_dma_stop();
@@ -640,7 +739,7 @@ static void cam_task(void *arg)
                     if(lcd_cam_obj->cam.frame_en[frame_pos] == 0) {
                         state = CAM_STATE_IDLE;
                         frame_buffer_event.frame_buffer = &lcd_cam_obj->cam.frame_buffer[frame_pos * lcd_cam_obj->cam.recv_size];
-                        frame_buffer_event.len = (cnt + 1) * lcd_cam_obj->cam.dma_half_buffer_size;
+                        frame_buffer_event.len = (cnt + 1) * (lcd_cam_obj->cam.dma_half_buffer_size>>1);
                         if(xQueueSend(lcd_cam_obj->cam.frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
                             lcd_cam_obj->cam.frame_en[frame_pos] = 1;
                         }
@@ -679,32 +778,58 @@ static void cam_give(uint8_t *dma_buffer)
 static esp_err_t cam_set_pin(cam_config_t *config)
 {
     if (config->width <= CAM_DATA_MAX_WIDTH && config->width % 8 == 0) {
-        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.href], PIN_FUNC_GPIO);
-        gpio_set_direction(config->pin.href, GPIO_MODE_INPUT);
-        gpio_set_pull_mode(config->pin.href, GPIO_FLOATING);
-        gpio_matrix_in(config->pin.href, CAM_H_ENABLE_IDX, config->invert.href);
-
-        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.vsync], PIN_FUNC_GPIO);
-        gpio_set_direction(config->pin.vsync, GPIO_MODE_INPUT);
-        gpio_set_pull_mode(config->pin.vsync, GPIO_FLOATING);
-        gpio_matrix_in(config->pin.vsync, CAM_V_SYNC_IDX, config->invert.vsync);
+        gpio_config_t io_conf = {0};
+        io_conf.intr_type = config->invert.vsync ? GPIO_PIN_INTR_NEGEDGE : GPIO_PIN_INTR_POSEDGE;
+        io_conf.pin_bit_mask = 1ULL << config->pin.vsync; 
+        io_conf.mode = GPIO_MODE_INPUT;
+        io_conf.pull_up_en = 1;
+        io_conf.pull_down_en = 0;
+        gpio_config(&io_conf);
+        gpio_install_isr_service(ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM);
+        gpio_isr_handler_add(config->pin.vsync, cam_vsync_isr, NULL);
+        gpio_intr_disable(config->pin.vsync);
 
         PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.pclk], PIN_FUNC_GPIO);
         gpio_set_direction(config->pin.pclk, GPIO_MODE_INPUT);
         gpio_set_pull_mode(config->pin.pclk, GPIO_FLOATING);
-        gpio_matrix_in(config->pin.pclk, CAM_PCLK_IDX, config->invert.pclk);
+        gpio_matrix_in(config->pin.pclk, I2S0I_WS_IN_IDX, config->invert.pclk);
+
+        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.vsync], PIN_FUNC_GPIO);
+        gpio_set_direction(config->pin.vsync, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(config->pin.vsync, GPIO_FLOATING);
+        gpio_matrix_in(config->pin.vsync, I2S0I_V_SYNC_IDX, !config->invert.vsync);
+
+        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.href], PIN_FUNC_GPIO);
+        gpio_set_direction(config->pin.href, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(config->pin.href, GPIO_FLOATING);
+        gpio_matrix_in(config->pin.href, I2S0I_H_SYNC_IDX, config->invert.href);
 
         for(int i = 0; i < config->width; i++) {
             PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.data[i]], PIN_FUNC_GPIO);
             gpio_set_direction(config->pin.data[i], GPIO_MODE_INPUT);
             gpio_set_pull_mode(config->pin.data[i], GPIO_FLOATING);
-            gpio_matrix_in(config->pin.data[i], CAM_DATA_IN0_IDX + i, config->invert.data[i]);
+            // High bit alignment, IN16 is always the highest bit
+            gpio_matrix_in(config->pin.data[i], I2S0I_DATA_IN0_IDX + (CAM_DATA_MAX_WIDTH - config->width) + i, config->invert.data[i]);
         }
 
-        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[config->pin.xclk], PIN_FUNC_GPIO);
-        gpio_set_direction(config->pin.xclk, GPIO_MODE_OUTPUT);
-        gpio_set_pull_mode(config->pin.xclk, GPIO_FLOATING);
-        gpio_matrix_out(config->pin.xclk, CAM_CLK_IDX, config->invert.xclk, false);
+        ledc_timer_config_t ledc_timer = {
+            .duty_resolution = LEDC_TIMER_1_BIT,
+            .freq_hz = config->fre,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .timer_num = LEDC_TIMER_1
+        };
+        ledc_timer_config(&ledc_timer);
+        ledc_channel_config_t ledc_channel = {
+            .channel    = LEDC_CHANNEL_2,
+            .duty       = 1,
+            .gpio_num   = config->pin.xclk,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .timer_sel  = LEDC_TIMER_1,
+            .hpoint     = 0
+        };
+        ledc_channel_config(&ledc_channel);
+
+        gpio_matrix_in(0x38, I2S0I_H_ENABLE_IDX, false);
     } else {
         ESP_LOGE(TAG, "cam width wrong!");
         return ESP_FAIL;
@@ -714,37 +839,50 @@ static esp_err_t cam_set_pin(cam_config_t *config)
 
 static esp_err_t cam_dma_config(cam_config_t *config) 
 {
+    if (config->recv_size % 2 != 0) {
+         ESP_LOGE(TAG, "ESP32 only supports 2-byte aligned data length");
+         return ESP_FAIL;
+    }
     int cnt = 0;
+    uint32_t recv_size = config->recv_size * 2; // ESP32 4byte data-> 2byte valid data 
     if (config->mode.jpeg) {
         lcd_cam_obj->cam.dma_buffer_size = 2048;
         lcd_cam_obj->cam.dma_half_buffer_size = lcd_cam_obj->cam.dma_buffer_size / 2;
         lcd_cam_obj->cam.dma_node_buffer_size = lcd_cam_obj->cam.dma_half_buffer_size;
     } else {
-        if (config->max_dma_buffer_size / 2.0 > 16384) { // must less than max(cam_rec_data_bytelen)
-            config->max_dma_buffer_size = 16384 * 2;
-        }
         for (cnt = 0; cnt < config->max_dma_buffer_size; cnt++) { // Find a buffer size that can be divisible by
-            if (lcd_cam_obj->cam.recv_size % (config->max_dma_buffer_size - cnt) == 0) {
+            if ((recv_size % (config->max_dma_buffer_size - cnt) == 0) && (((config->max_dma_buffer_size - cnt) / 2) % 4 == 0)) {
                 break;
             }
         }
+
+        if (config->max_dma_buffer_size - cnt <= 4) {
+            ESP_LOGE(TAG, "Can't find suitable dma_buffer_size");
+            return ESP_FAIL;
+        }
+
         lcd_cam_obj->cam.dma_buffer_size = config->max_dma_buffer_size - cnt;
         lcd_cam_obj->cam.dma_half_buffer_size = lcd_cam_obj->cam.dma_buffer_size / 2;
         for (cnt = 0; cnt < LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE; cnt++) { // Find a divisible dma size
-            if ((lcd_cam_obj->cam.dma_half_buffer_size) % (LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - cnt) == 0) {
+            if (((lcd_cam_obj->cam.dma_half_buffer_size) % (LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - cnt) == 0)  && ((LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - cnt) % 4 == 0)) {
                 break;
             }
+        }
+
+        if (LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - cnt <= 4) {
+            ESP_LOGE(TAG, "Can't find suitable dma_node_buffer_size");
+            return ESP_FAIL;
         }
         lcd_cam_obj->cam.dma_node_buffer_size = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - cnt;
     }
 
     lcd_cam_obj->cam.dma_node_cnt = (lcd_cam_obj->cam.dma_buffer_size) / lcd_cam_obj->cam.dma_node_buffer_size; // Number of DMA nodes
-    lcd_cam_obj->cam.frame_copy_cnt = lcd_cam_obj->cam.recv_size / lcd_cam_obj->cam.dma_half_buffer_size; // Number of interrupted copies, ping-pong copy
+    lcd_cam_obj->cam.frame_copy_cnt = recv_size / lcd_cam_obj->cam.dma_half_buffer_size; // Number of interrupted copies, ping-pong copy
 
     ESP_LOGI(TAG, "cam_buffer_size: %d, cam_dma_size: %d, cam_dma_node_cnt: %d, cam_total_cnt: %d\n", lcd_cam_obj->cam.dma_buffer_size, lcd_cam_obj->cam.dma_node_buffer_size, lcd_cam_obj->cam.dma_node_cnt, lcd_cam_obj->cam.frame_copy_cnt);
 
-    lcd_cam_obj->cam.dma    = (lldesc_t *)heap_caps_malloc(lcd_cam_obj->cam.dma_node_cnt * sizeof(lldesc_t), MALLOC_CAP_DMA);
-    lcd_cam_obj->cam.dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->cam.dma_buffer_size * sizeof(uint8_t), MALLOC_CAP_DMA);
+    lcd_cam_obj->cam.dma    = (lldesc_t *)heap_caps_malloc(lcd_cam_obj->cam.dma_node_cnt * sizeof(lldesc_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lcd_cam_obj->cam.dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->cam.dma_buffer_size * sizeof(uint8_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
 
     for (int x = 0; x < lcd_cam_obj->cam.dma_node_cnt; x++) {
         lcd_cam_obj->cam.dma[x].size = lcd_cam_obj->cam.dma_node_buffer_size;
@@ -755,8 +893,8 @@ static esp_err_t cam_dma_config(cam_config_t *config)
         lcd_cam_obj->cam.dma[x].empty = &lcd_cam_obj->cam.dma[(x + 1) % lcd_cam_obj->cam.dma_node_cnt];
     }
 
-    GDMA.in_link[lcd_cam_obj->dma_num].addr = ((uint32_t)&lcd_cam_obj->cam.dma[0]) & 0xfffff;
-    LCD_CAM.cam_ctrl1.cam_rec_data_bytelen = lcd_cam_obj->cam.dma_half_buffer_size - 1; // Ping pong operation
+    I2S0.in_link.addr = ((uint32_t)&lcd_cam_obj->cam.dma[0]) & 0xfffff;
+    I2S0.rx_eof_num = lcd_cam_obj->cam.dma_half_buffer_size / 4; // Ping-pong operation, ESP32 4Byte
     return ESP_OK;
 }
 
@@ -780,6 +918,7 @@ esp_err_t lcd_cam_deinit(lcd_cam_handle_t *handle)
 
     if (lcd_cam_obj->cam_en) {
         cam_stop();
+        gpio_isr_handler_remove(lcd_cam_obj->cam.vsync_pin);
         if (lcd_cam_obj->cam.task_handle) {
             vTaskDelete(lcd_cam_obj->cam.task_handle);
         }
@@ -802,12 +941,13 @@ esp_err_t lcd_cam_deinit(lcd_cam_handle_t *handle)
             free(lcd_cam_obj->cam.frame_buffer);
         }
     }
-    
+
     if (lcd_cam_obj->lcd_cam_intr_handle) {
         esp_intr_free(lcd_cam_obj->lcd_cam_intr_handle);
     }   
-    if (lcd_cam_obj->dma_intr_handle) {
-        esp_intr_free(lcd_cam_obj->dma_intr_handle);
+    
+    if (lcd_cam_obj->spi_intr_handle) {
+        esp_intr_free(lcd_cam_obj->spi_intr_handle);
     }   
     free(lcd_cam_obj);
     lcd_cam_obj = NULL;
@@ -830,40 +970,20 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
     //Enable LCD_CAM periph
 
     if (config->lcd.width == 1) {
-        if (REG_GET_BIT(SYSTEM_PERIP_CLK_EN0_REG, SYSTEM_SPI3_CLK_EN) == 0) {
-            REG_CLR_BIT(SYSTEM_PERIP_CLK_EN0_REG, SYSTEM_SPI3_CLK_EN);
-            REG_SET_BIT(SYSTEM_PERIP_CLK_EN0_REG, SYSTEM_SPI3_CLK_EN);
-            REG_SET_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
-            REG_CLR_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
+        if (DPORT_REG_GET_BIT(DPORT_PERIP_CLK_EN_REG, DPORT_SPI3_CLK_EN) == 0) {
+            DPORT_REG_CLR_BIT(DPORT_PERIP_CLK_EN_REG, DPORT_SPI3_CLK_EN);
+            DPORT_REG_SET_BIT(DPORT_PERIP_CLK_EN_REG, DPORT_SPI3_CLK_EN);
+            DPORT_REG_SET_BIT(DPORT_PERIP_RST_EN_REG, DPORT_SPI3_RST);
+            DPORT_REG_CLR_BIT(DPORT_PERIP_RST_EN_REG, DPORT_SPI3_RST);
+            DPORT_REG_CLR_BIT(DPORT_PERIP_CLK_EN_REG, DPORT_SPI_DMA_CLK_EN);
+            DPORT_REG_SET_BIT(DPORT_PERIP_CLK_EN_REG, DPORT_SPI_DMA_CLK_EN);
+            DPORT_REG_SET_BIT(DPORT_PERIP_RST_EN_REG, DPORT_SPI_DMA_RST);
+            DPORT_REG_CLR_BIT(DPORT_PERIP_RST_EN_REG, DPORT_SPI_DMA_RST);
+            DPORT_SET_PERI_REG_BITS(DPORT_SPI_DMA_CHAN_SEL_REG, DPORT_SPI3_DMA_CHAN_SEL, 1, DPORT_SPI3_DMA_CHAN_SEL_S); // ESP32 SPI DMA Channel config, channel 0, SPI3
         }
     }
 
-    if (REG_GET_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_LCD_CAM_CLK_EN) == 0) {
-        REG_CLR_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_LCD_CAM_CLK_EN);
-        REG_SET_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_LCD_CAM_CLK_EN);
-        REG_SET_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_LCD_CAM_RST);
-        REG_CLR_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_LCD_CAM_RST);
-    }
-
-    if (REG_GET_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_DMA_CLK_EN) == 0) {
-        REG_CLR_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_DMA_CLK_EN);
-        REG_SET_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_DMA_CLK_EN);
-        REG_SET_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
-        REG_CLR_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
-    }
-
-    for (int x = 0; x < LCD_CAM_DMA_MAX_NUM; x++) {
-        if (GDMA.out_link[x].start == 0x0 && GDMA.in_link[x].start == 0x0) {
-            lcd_cam_obj->dma_num = x;
-            break;
-        }
-        if (x == LCD_CAM_DMA_MAX_NUM - 1) {
-            ESP_LOGE(TAG, "DMA error\n");
-            lcd_cam_deinit(handle);
-            return ESP_FAIL;
-        }
-    }
-
+    periph_module_enable(PERIPH_I2S0_MODULE);
     lcd_cam_obj->lcd_en = config->lcd.en;
     lcd_cam_obj->cam_en = config->cam.en;
     ret |= lcd_cam_config(config);
@@ -887,20 +1007,32 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
         lcd_cam_obj->lcd.event_queue = xQueueCreate(1, sizeof(int));
         lcd_cam_obj->lcd.width = config->lcd.width;
         lcd_cam_obj->lcd.swap_data = config->lcd.swap_data;
+
         if (lcd_cam_obj->lcd.event_queue == NULL) {
             ESP_LOGE(TAG, "lcd config fail!");
             lcd_cam_deinit(handle);
             return ESP_FAIL;
         }
 
-        if (config->lcd.width == 1) {
-            handle->lcd.write_data = spi_write_data;
-        } else if (config->lcd.width <= LCD_DATA_MAX_WIDTH && config->lcd.width % 8 == 0){
-            handle->lcd.write_data = lcd_write_data;
+        switch (config->lcd.width) {
+            case 1: {
+                handle->lcd.write_data = spi_write_data;
+            }
+            break;
+
+            case 8: {
+                handle->lcd.write_data = i2s_write_8bit_data;
+            }
+            break;
+
+            case 16: {
+                handle->lcd.write_data = i2s_write_16bit_data;
+            }
+            break;
         }
         
         handle->lcd.swap_data = lcd_swap_data;
-        ESP_LOGI(TAG, "lcd init ok\n");
+        ESP_LOGI(TAG, "lcd init ok");
     }
 
     if (lcd_cam_obj->cam_en) {
@@ -943,12 +1075,15 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
         handle->cam.stop  = cam_stop;
         handle->cam.take  = cam_take;
         handle->cam.give  = cam_give;
-        ESP_LOGI(TAG, "cam init ok\n");
+        ESP_LOGI(TAG, "cam init ok");
     }
 
     if (lcd_cam_obj->lcd_en || lcd_cam_obj->cam_en) {
-        ret |= esp_intr_alloc((DMA_CH0_INTR_SOURCE + lcd_cam_obj->dma_num), ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM, dma_isr, NULL, &lcd_cam_obj->dma_intr_handle);
-        ret |= esp_intr_alloc(LCD_CAM_INTR_SOURCE, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM, lcd_cam_isr, NULL, &lcd_cam_obj->lcd_cam_intr_handle);
+        ret |= esp_intr_alloc(ETS_I2S0_INTR_SOURCE, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM, i2s_isr, NULL, &lcd_cam_obj->lcd_cam_intr_handle);
+        if (lcd_cam_obj->lcd_en && config->lcd.width == 1) {
+            ret |= esp_intr_alloc(ETS_SPI3_DMA_INTR_SOURCE, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM, spi_isr, NULL, &lcd_cam_obj->spi_intr_handle);
+            ret |= esp_intr_enable(lcd_cam_obj->spi_intr_handle);
+        }
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "lcd_cam intr alloc fail!");

@@ -1,0 +1,119 @@
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  build_esp32s3:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/cache@master
+      id: espressif
+      with:
+        path: |
+          ~/.espressif
+        key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+    - uses: actions/checkout@master
+      with:
+        submodules: true
+
+    - name: esp32s3_build_test
+      run: |
+        export PROJECT_PATH=$PWD
+        cd $PROJECT_PATH/.github/workflows
+        git clone --recursive https://github.com/espressif/esp-idf
+        git submodule update --init --recursive
+        ./install.sh
+        . ./export.sh
+        echo $PATH
+        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        export TEST_PATH=$PWD
+        mkdir -p components/lcd_cam
+        cd components/lcd_cam
+        cp -r $PROJECT_PATH/esp32* .
+        cp $PROJECT_PATH/CMakeLists.txt .
+        cd $TEST_PATH
+        idf.py --preview set-target esp32s3
+        idf.py build
+    - uses: actions/upload-artifact@v2
+      with:
+        name: esp32s3_build
+        path: .github/workflows/lcd_cam/build
+
+  build_esp32s2:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/cache@master
+      id: espressif
+      with:
+        path: |
+          ~/.espressif
+        key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+    - uses: actions/checkout@master
+      with:
+        submodules: true
+
+    - name: esp32s2_build_test
+      run: |
+        export PROJECT_PATH=$PWD
+        cd $PROJECT_PATH/.github/workflows
+        git clone --recursive https://github.com/espressif/esp-idf
+        git submodule update --init --recursive
+        ./install.sh
+        . ./export.sh
+        echo $PATH
+        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        export TEST_PATH=$PWD
+        mkdir -p components/lcd_cam
+        cd components/lcd_cam
+        cp -r $PROJECT_PATH/esp32* .
+        cp $PROJECT_PATH/CMakeLists.txt .
+        cd $TEST_PATH
+        idf.py set-target esp32s2
+        idf.py build
+    - uses: actions/upload-artifact@v2
+      with:
+        name: esp32s2_build
+        path: .github/workflows/lcd_cam/build
+
+  build_esp32:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/cache@master
+      id: espressif
+      with:
+        path: |
+          ~/.espressif
+        key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+    - uses: actions/checkout@master
+      with:
+        submodules: true
+
+    - name: esp32_build_test
+      run: |
+        export PROJECT_PATH=$PWD
+        cd $PROJECT_PATH/.github/workflows
+        git clone --recursive https://github.com/espressif/esp-idf
+        git submodule update --init --recursive
+        ./install.sh
+        . ./export.sh
+        echo $PATH
+        cd $PROJECT_PATH/.github/workflows/lcd_cam
+        export TEST_PATH=$PWD
+        mkdir -p components/lcd_cam
+        cd components/lcd_cam
+        cp -r $PROJECT_PATH/esp32* .
+        cp $PROJECT_PATH/CMakeLists.txt .
+        cd $TEST_PATH
+        idf.py set-target esp32
+        idf.py build
+    - uses: actions/upload-artifact@v2
+      with:
+        name: esp32_build
+        path: .github/workflows/lcd_cam/build
