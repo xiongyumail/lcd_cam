@@ -119,3 +119,39 @@ jobs:
       with:
         name: esp32_build
         path: test/lcd_cam/build
+
+  build_esp32c3:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/cache@master
+      id: espressif
+      with:
+        path: |
+          ~/.espressif
+        key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+    - uses: actions/checkout@master
+      with:
+        submodules: true
+
+    - name: esp32_c3_build_test
+      run: |
+        export PROJECT_PATH=$PWD
+        cd $PROJECT_PATH/.github/workflows
+        git clone --recursive https://github.com/espressif/esp-idf
+        git submodule update --init --recursive
+        ./esp-idf/install.sh
+        . ./esp-idf/export.sh
+        echo $PATH
+        cd $PROJECT_PATH/test/lcd_cam
+        export TEST_PATH=$PWD
+        mkdir -p components/lcd_cam
+        cd components/lcd_cam
+        cp -r $PROJECT_PATH/esp32* .
+        cp $PROJECT_PATH/CMakeLists.txt .
+        cd $TEST_PATH
+        idf.py set-target esp32c3
+        idf.py build
+    - uses: actions/upload-artifact@v2
+      with:
+        name: esp32c3_build
+        path: test/lcd_cam/build

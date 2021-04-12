@@ -16,4 +16,10 @@ if(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND COMPONENT_ADD_INCLUDEDIRS "esp32s3/include")
 endif()
 
+if(IDF_TARGET STREQUAL "esp32c3")
+    list(APPEND COMPONENT_SRCS "esp32c3/lcd_cam.c")
+    list(APPEND COMPONENT_PRIV_INCLUDEDIRS "esp32c3/include/soc")
+    list(APPEND COMPONENT_ADD_INCLUDEDIRS "esp32c3/include")
+endif()
+
 register_component()

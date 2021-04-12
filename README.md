@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/xiongyumail/lcd_cam/actions/workflows/main.yml/badge.svg)](https://github.com/xiongyumail/lcd_cam/actions/workflows/main.yml)
 
-lcd & cam driver for esp32, esp32s2, esp32s3
+lcd & cam driver for esp32, esp32s2, esp32c3, esp32s3
 
 1. Add lcd_cam to your project components
 
