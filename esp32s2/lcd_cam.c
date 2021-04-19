@@ -254,6 +254,7 @@ static void i2s_write_data(uint8_t *data, size_t len)
 
 static void spi_start(uint32_t addr, size_t len)
 {
+    while (GPSPI3.cmd.usr);
     GPSPI3.mosi_dlen.usr_mosi_bit_len = len * 8 - 1;
     GPSPI3.dma_out_link.addr = addr;
     GPSPI3.dma_out_link.start = 1;

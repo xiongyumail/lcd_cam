@@ -108,7 +108,7 @@ static void lcd_dma_set_left(int pos, size_t len)
 
 static void spi_start(uint32_t addr, size_t len)
 {
-    GPSPI2.cmd.usr = 0;
+    while (GPSPI2.cmd.usr);
     GPSPI2.ms_dlen.ms_data_bitlen = len * 8 - 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.out_rst = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.out_rst = 0;

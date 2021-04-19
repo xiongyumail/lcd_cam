@@ -354,6 +354,7 @@ static void i2s_write_16bit_data(uint8_t *data, size_t len)
 
 static void spi_start(uint32_t addr, size_t len)
 {
+    while (SPI3.cmd.usr);
     SPI3.mosi_dlen.usr_mosi_dbitlen = len * 8 - 1;
     SPI3.dma_out_link.addr = addr;
     SPI3.dma_out_link.start = 1;

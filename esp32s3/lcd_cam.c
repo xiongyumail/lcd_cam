@@ -248,7 +248,7 @@ static void lcd_write_data(uint8_t *data, size_t len)
 
 static void spi_start(uint32_t addr, size_t len)
 {
-    GPSPI3.cmd.usr = 0;
+    while (GPSPI3.cmd.usr);
     GPSPI3.ms_dlen.ms_data_bitlen = len * 8 - 1;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 1;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 0;
