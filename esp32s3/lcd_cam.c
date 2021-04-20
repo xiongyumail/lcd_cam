@@ -254,6 +254,7 @@ static void spi_start(uint32_t addr, size_t len)
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 0;
     GDMA.out[lcd_cam_obj->dma_num].link.addr = addr;
     GDMA.out[lcd_cam_obj->dma_num].link.start = 1;
+    esp_rom_delay_us(1);
     GPSPI3.cmd.update = 1;
     while (GPSPI3.cmd.update);
     GPSPI3.cmd.usr = 1;
