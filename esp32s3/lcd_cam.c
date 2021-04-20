@@ -182,8 +182,18 @@ static void lcd_start(uint32_t addr, size_t len)
     LCD_CAM.lcd_user.lcd_reset = 0;
     LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
     LCD_CAM.lcd_misc.lcd_afifo_reset = 0;
+    while (GDMA.out[lcd_cam_obj->dma_num].link.start);
+    GDMA.out[lcd_cam_obj->dma_num].conf0.val = 0;
+    GDMA.out[lcd_cam_obj->dma_num].conf1.val = 0;
+    GDMA.out[lcd_cam_obj->dma_num].int_clr.val = ~0;
+    GDMA.out[lcd_cam_obj->dma_num].int_ena.val = 0;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 1;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 0;
+    GDMA.out[lcd_cam_obj->dma_num].conf0.outdscr_burst_en = 1;
+    GDMA.out[lcd_cam_obj->dma_num].conf0.out_data_burst_en = 1;
+    GDMA.out[lcd_cam_obj->dma_num].peri_sel.sel = 5;
+    GDMA.out[lcd_cam_obj->dma_num].pri.tx_pri = 1;
+    GDMA.out[lcd_cam_obj->dma_num].int_ena.out_eof = 1;
     GDMA.out[lcd_cam_obj->dma_num].link.addr = addr;
     GDMA.out[lcd_cam_obj->dma_num].link.start = 1;
     esp_rom_delay_us(1);
@@ -250,8 +260,18 @@ static void spi_start(uint32_t addr, size_t len)
 {
     while (GPSPI3.cmd.usr);
     GPSPI3.ms_dlen.ms_data_bitlen = len * 8 - 1;
+    while (GDMA.out[lcd_cam_obj->dma_num].link.start);
+    GDMA.out[lcd_cam_obj->dma_num].conf0.val = 0;
+    GDMA.out[lcd_cam_obj->dma_num].conf1.val = 0;
+    GDMA.out[lcd_cam_obj->dma_num].int_clr.val = ~0;
+    GDMA.out[lcd_cam_obj->dma_num].int_ena.val = 0;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 1;
     GDMA.out[lcd_cam_obj->dma_num].conf0.out_rst = 0;
+    GDMA.out[lcd_cam_obj->dma_num].conf0.outdscr_burst_en = 1;
+    GDMA.out[lcd_cam_obj->dma_num].conf0.out_data_burst_en = 1;
+    GDMA.out[lcd_cam_obj->dma_num].peri_sel.sel = 1;
+    GDMA.out[lcd_cam_obj->dma_num].pri.tx_pri = 1;
+    GDMA.out[lcd_cam_obj->dma_num].int_ena.out_eof = 1;
     GDMA.out[lcd_cam_obj->dma_num].link.addr = addr;
     GDMA.out[lcd_cam_obj->dma_num].link.start = 1;
     esp_rom_delay_us(1);
@@ -560,6 +580,10 @@ static void cam_dma_start(void)
         LCD_CAM.cam_ctrl1.cam_afifo_reset = 0;
         GDMA.in[lcd_cam_obj->dma_num].conf0.in_rst = 1;
         GDMA.in[lcd_cam_obj->dma_num].conf0.in_rst = 0;
+        GDMA.in[lcd_cam_obj->dma_num].conf0.indscr_burst_en = 1;
+        GDMA.in[lcd_cam_obj->dma_num].conf0.in_data_burst_en = 1;
+        GDMA.in[lcd_cam_obj->dma_num].peri_sel.sel = 5;
+        GDMA.in[lcd_cam_obj->dma_num].pri.rx_pri = 1;
         GDMA.in[lcd_cam_obj->dma_num].link.start = 1;
         LCD_CAM.cam_ctrl.cam_update = 1;
         LCD_CAM.cam_ctrl1.cam_start = 1;
@@ -861,7 +885,7 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
         REG_CLR_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
     }
 
-    for (int x = 0; x < LCD_CAM_DMA_MAX_NUM; x++) {
+    for (int x = LCD_CAM_DMA_MAX_NUM - 1; x >= 0; x++) {
         if (GDMA.out[x].link.start == 0x0 && GDMA.in[x].link.start == 0x0) {
             lcd_cam_obj->dma_num = x;
             break;

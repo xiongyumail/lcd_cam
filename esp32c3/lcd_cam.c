@@ -110,8 +110,19 @@ static void spi_start(uint32_t addr, size_t len)
 {
     while (GPSPI2.cmd.usr);
     GPSPI2.ms_dlen.ms_data_bitlen = len * 8 - 1;
+    while (GDMA.channel[lcd_cam_obj->dma_num].out.out_link.start);
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.val = 0;
+    GDMA.channel[lcd_cam_obj->dma_num].in.in_conf0.mem_trans_en = 0;
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_conf1.val = 0;
+    GDMA.intr[lcd_cam_obj->dma_num].clr.val = ~0;
+    GDMA.intr[lcd_cam_obj->dma_num].ena.val = 0;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.out_rst = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.out_rst = 0;
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.outdscr_burst_en = 1;
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.out_data_burst_en = 1;
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_peri_sel.sel = 0;
+    GDMA.channel[lcd_cam_obj->dma_num].out.out_pri.tx_pri = 1;
+    GDMA.intr[lcd_cam_obj->dma_num].ena.out_eof = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_link.addr = addr;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_link.start = 1;
     esp_rom_delay_us(1);
@@ -185,7 +196,6 @@ static esp_err_t lcd_cam_config(lcd_cam_config_t *config)
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf0.val = 0;
     GDMA.channel[lcd_cam_obj->dma_num].in.in_conf0.mem_trans_en = 0;
     GDMA.channel[lcd_cam_obj->dma_num].out.out_conf1.val = 0;
-    GDMA.channel[lcd_cam_obj->dma_num].out.out_conf1.out_check_owner = 0;
     GDMA.intr[lcd_cam_obj->dma_num].clr.val = ~0;
     GDMA.intr[lcd_cam_obj->dma_num].ena.val = 0;
 
@@ -361,7 +371,7 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
         REG_CLR_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
     }
 
-    for (int x = 0; x < LCD_CAM_DMA_MAX_NUM; x++) {
+    for (int x = LCD_CAM_DMA_MAX_NUM - 1; x >= 0; x++) {
         if (GDMA.channel[lcd_cam_obj->dma_num].out.out_link.start == 0x0) {
             lcd_cam_obj->dma_num = x;
             break;
