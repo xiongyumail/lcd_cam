@@ -177,7 +177,7 @@ static void lcd_dma_set_left(int pos, size_t len)
 
 static void lcd_start(uint32_t addr, size_t len)
 {
-    LCD_CAM.lcd_user.lcd_start = 0;
+    while (LCD_CAM.lcd_user.lcd_start);
     LCD_CAM.lcd_user.lcd_reset = 1;
     LCD_CAM.lcd_user.lcd_reset = 0;
     LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
