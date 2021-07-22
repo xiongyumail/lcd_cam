@@ -21,6 +21,7 @@
 #include "esp_log.h"
 #include "esp32s3/rom/lldesc.h"
 #include "esp32s3/rom/gpio.h"
+#include "esp32s3/rom/cache.h"
 #include "driver/gpio.h"
 #include "spi_struct.h"
 #include "gdma_struct.h"
@@ -73,9 +74,9 @@ typedef struct {
     uint32_t frame_copy_cnt;
     uint32_t frame_cnt;
     uint32_t recv_size;
-    lldesc_t *dma;
+    lldesc_t **dma;
     uint8_t  *dma_buffer;
-    uint8_t *frame_buffer;
+    uint8_t **frame_buffer;
     uint8_t *frame_en;
     QueueHandle_t event_queue;
     QueueHandle_t frame_buffer_queue;
@@ -191,12 +192,18 @@ static void lcd_start(uint32_t addr, size_t len)
     GDMA.channel[lcd_cam_obj->dma_num].out.conf0.out_rst = 0;
     GDMA.channel[lcd_cam_obj->dma_num].out.conf0.outdscr_burst_en = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.conf0.out_data_burst_en = 1;
+    GDMA.channel[lcd_cam_obj->dma_num].out.conf1.out_ext_mem_bk_size = 2;
+    GDMA.sram_size[lcd_cam_obj->dma_num].out.out_size = 14; // fifo 128 Bytes
     GDMA.channel[lcd_cam_obj->dma_num].out.peri_sel.sel = 5;
     GDMA.channel[lcd_cam_obj->dma_num].out.pri.tx_pri = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.int_ena.out_eof = 1;
     GDMA.channel[lcd_cam_obj->dma_num].out.link.addr = addr;
     GDMA.channel[lcd_cam_obj->dma_num].out.link.start = 1;
-    esp_rom_delay_us(1);
+    if (len > 16) {
+        while (GDMA.channel[lcd_cam_obj->dma_num].out.outfifo_status.outfifo_cnt_l3 < 16);
+    } else {
+        esp_rom_delay_us(1);
+    }
     LCD_CAM.lcd_user.lcd_update = 1;
     LCD_CAM.lcd_user.lcd_start = 1;
 }
@@ -209,51 +216,87 @@ static void lcd_write_data(uint8_t *data, size_t len)
         ESP_LOGE(TAG, "wrong len!");
         return;
     }
-    lcd_dma_set_int();
-    cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
-    // Start signal
-    xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
-    // Process a complete piece of data, ping-pong operation
-    for (x = 0; x < cnt; x++) {
-        uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
-        uint8_t *in  = data;
-        if (lcd_cam_obj->lcd.swap_data) {
-            for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=2) {
-                out[y+1] = in[y+0];
-                out[y+0] = in[y+1];
-            }
-        } else {
-            memcpy(out, in, lcd_cam_obj->lcd.dma_half_buffer_size);
-        }
-        data += lcd_cam_obj->lcd.dma_half_buffer_size;
-        xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
-        lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, lcd_cam_obj->lcd.dma_half_buffer_size);
-    }
-    left = len % lcd_cam_obj->lcd.dma_half_buffer_size;
-    // Process remaining incomplete segment data
-    if (left) {
-        uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
-        uint8_t *in  = data;
-        cnt = left - left % 2;
-        if (cnt) {
+    if (0) {
+        lcd_dma_set_int();
+        cnt = len / lcd_cam_obj->lcd.dma_half_buffer_size;
+        // Start signal
+        xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
+        // Process a complete piece of data, ping-pong operation
+        for (x = 0; x < cnt; x++) {
+            uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
+            uint8_t *in  = data;
             if (lcd_cam_obj->lcd.swap_data) {
-                for (y = 0; y < cnt; y+=2) {
+                for (y = 0; y < lcd_cam_obj->lcd.dma_half_buffer_size; y+=2) {
                     out[y+1] = in[y+0];
                     out[y+0] = in[y+1];
                 }
             } else {
-                memcpy(out, in, cnt);
+                memcpy(out, in, lcd_cam_obj->lcd.dma_half_buffer_size);
             }
+            data += lcd_cam_obj->lcd.dma_half_buffer_size;
+            xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+            lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, lcd_cam_obj->lcd.dma_half_buffer_size);
         }
+        left = len % lcd_cam_obj->lcd.dma_half_buffer_size;
+        // Process remaining incomplete segment data
+        if (left) {
+            uint8_t *out = lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt].buf;
+            uint8_t *in  = data;
+            cnt = left - left % 2;
+            if (cnt) {
+                if (lcd_cam_obj->lcd.swap_data) {
+                    for (y = 0; y < cnt; y+=2) {
+                        out[y+1] = in[y+0];
+                        out[y+0] = in[y+1];
+                    }
+                } else {
+                    memcpy(out, in, cnt);
+                }
+            }
 
-        if (left % 2) {
-            out[cnt] = in[cnt];
+            if (left % 2) {
+                out[cnt] = in[cnt];
+            }
+            lcd_dma_set_left(x, left);
+            xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+            lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, left);
         }
-        lcd_dma_set_left(x, left);
         xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
-        lcd_start(((uint32_t)&lcd_cam_obj->lcd.dma[(x % 2) * lcd_cam_obj->lcd.dma_half_node_cnt]) & 0xfffff, left);
+    } else {
+        Cache_WriteBack_Addr(data, len);
+        if (lcd_cam_obj->lcd.swap_data) {
+            LCD_CAM.lcd_user.lcd_8bits_order = 0;
+        }
+        if (len % LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE) {
+            cnt = len / LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+            left = len % LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+        } else {
+            cnt = len / LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1;
+            left = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+        }
+        lldesc_t *dma = (lldesc_t *)heap_caps_malloc((cnt + 1) * sizeof(lldesc_t), MALLOC_CAP_DMA);
+        // lldesc_t *dma = lcd_cam_obj->lcd.dma;
+        for (x = 0; x < cnt; x++) {
+            dma[x].size = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+            dma[x].length = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+            dma[x].buf = (data + LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE * x);
+            dma[x].eof = 0;
+            dma[x].empty = &dma[(x + 1)];
+        }
+        if (left) {
+            dma[x].size = left;
+            dma[x].length = left;
+            dma[x].buf = (data + LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE * x);
+            dma[x].eof = 1;
+            dma[x].empty = NULL;
+        }
+        xQueueSend(lcd_cam_obj->lcd.event_queue, &event, 0);
+        xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+        lcd_start(((uint32_t)&dma[0]) & 0xfffff, len);
+        xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
+        free(dma);
+        LCD_CAM.lcd_user.lcd_8bits_order = 1;
     }
-    xQueueReceive(lcd_cam_obj->lcd.event_queue, (void *)&event, portMAX_DELAY);
 }
 
 static void spi_start(uint32_t addr, size_t len)
@@ -455,7 +498,7 @@ static esp_err_t lcd_cam_config(lcd_cam_config_t *config)
         LCD_CAM.cam_ctrl.cam_byte_order = 0;
         LCD_CAM.cam_ctrl.cam_bit_order = 0; 
         LCD_CAM.cam_ctrl.cam_line_int_en = 0;
-        LCD_CAM.cam_ctrl.cam_vs_eof_en = 0; // in_suc_eof interrupt generation method
+        LCD_CAM.cam_ctrl.cam_vs_eof_en = 1; // in_suc_eof interrupt generation method
         LCD_CAM.cam_ctrl1.val = 0;
         LCD_CAM.cam_ctrl1.cam_rec_data_bytelen = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1; // Cannot be assigned to 0, and it is easy to overflow
         LCD_CAM.cam_ctrl1.cam_line_int_num = 1  - 1; // The number of hsyncs that generate hs interrupts
@@ -513,6 +556,7 @@ static esp_err_t lcd_set_pin(lcd_config_t *config)
 
 static esp_err_t lcd_dma_config(lcd_config_t *config) 
 {
+#if 1
     int cnt = 0;
     if (LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE % 2 != 0) {
          ESP_LOGE(TAG, "need 2-byte aligned data length");
@@ -545,6 +589,12 @@ static esp_err_t lcd_dma_config(lcd_config_t *config)
 
     lcd_cam_obj->lcd.dma    = (lldesc_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_node_cnt * sizeof(lldesc_t), MALLOC_CAP_DMA);
     lcd_cam_obj->lcd.dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->lcd.dma_buffer_size * sizeof(uint8_t), MALLOC_CAP_DMA);
+#else
+    lcd_cam_obj->lcd.dma_node_buffer_size = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+    lcd_cam_obj->lcd.dma_buffer_size = config->max_dma_buffer_size;
+    lcd_cam_obj->lcd.dma_node_cnt = (lcd_cam_obj->lcd.dma_buffer_size) / lcd_cam_obj->lcd.dma_node_buffer_size; // Number of DMA nodes
+    lcd_cam_obj->lcd.dma    = (lldesc_t *)heap_caps_malloc((lcd_cam_obj->lcd.dma_node_cnt + 1) * sizeof(lldesc_t), MALLOC_CAP_DMA);
+#endif
     return ESP_OK;
 }
 
@@ -582,6 +632,8 @@ static void cam_dma_start(void)
         GDMA.channel[lcd_cam_obj->dma_num].in.conf0.in_rst = 0;
         GDMA.channel[lcd_cam_obj->dma_num].in.conf0.indscr_burst_en = 1;
         GDMA.channel[lcd_cam_obj->dma_num].in.conf0.in_data_burst_en = 1;
+        GDMA.channel[lcd_cam_obj->dma_num].in.conf1.in_ext_mem_bk_size = 2;
+        GDMA.sram_size[lcd_cam_obj->dma_num].in.in_size = 14; // fifo 128 Bytes
         GDMA.channel[lcd_cam_obj->dma_num].in.peri_sel.sel = 5;
         GDMA.channel[lcd_cam_obj->dma_num].in.pri.rx_pri = 1;
         GDMA.channel[lcd_cam_obj->dma_num].in.link.start = 1;
@@ -631,6 +683,7 @@ static void cam_task(void *arg)
     cam_event_t cam_event = {0};
     frame_buffer_event_t frame_buffer_event = {0};
     xQueueReset(lcd_cam_obj->cam.event_queue);
+#if 0
     while (1) {
         xQueueReceive(lcd_cam_obj->cam.event_queue, (void *)&cam_event, portMAX_DELAY);
         switch (state) {
@@ -686,6 +739,66 @@ static void cam_task(void *arg)
             break;
         }
     }
+#endif
+    while (1) {
+        xQueueReceive(lcd_cam_obj->cam.event_queue, (void *)&cam_event, portMAX_DELAY);
+        switch (state) {
+            case CAM_STATE_IDLE: {
+                if (cam_event == CAM_VSYNC_EVENT) { 
+                    for (int x = 0; x < lcd_cam_obj->cam.frame_cnt; x++) {
+                        if (lcd_cam_obj->cam.frame_en[x]) {
+                            frame_pos = x;
+                            GDMA.channel[lcd_cam_obj->dma_num].in.link.addr = ((uint32_t)&lcd_cam_obj->cam.dma[x][0]) & 0xfffff;
+                            cam_dma_start();
+                            // cam_vsync_intr_enable(false);
+                            state = CAM_STATE_READ_BUF;
+                            break;
+                        }
+                    }
+                    cnt = 0;
+                }
+            }
+            break;
+
+            case CAM_STATE_READ_BUF: {
+                if (cam_event == CAM_IN_SUC_EOF_EVENT) {
+                    lcd_cam_obj->cam.frame_en[frame_pos] = 0;
+
+                    // state = CAM_STATE_IDLE;
+                    frame_buffer_event.frame_buffer = &lcd_cam_obj->cam.frame_buffer[frame_pos][0];
+                    frame_buffer_event.len = lcd_cam_obj->cam.recv_size;
+                    if(xQueueSend(lcd_cam_obj->cam.frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
+                        lcd_cam_obj->cam.frame_en[frame_pos] = 1;
+                    }
+                    frame_pos = (frame_pos + 1) % (lcd_cam_obj->cam.frame_cnt);
+                    // // cam_dma_stop();
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.link.addr = ((uint32_t)&lcd_cam_obj->cam.dma[frame_pos][0]) & 0xfffff;
+                    // // GDMA.channel[lcd_cam_obj->dma_num].in.link.stop = 1;
+                    // // cam_dma_start();
+                    // LCD_CAM.cam_ctrl1.cam_start = 0;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.int_clr.in_suc_eof = 1;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.int_ena.in_suc_eof = 1;
+                    // LCD_CAM.cam_ctrl1.cam_reset = 1;
+                    // LCD_CAM.cam_ctrl1.cam_reset = 0;
+                    // LCD_CAM.cam_ctrl1.cam_afifo_reset = 1;
+                    // LCD_CAM.cam_ctrl1.cam_afifo_reset = 0;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.conf0.in_rst = 1;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.conf0.in_rst = 0;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.conf0.indscr_burst_en = 1;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.conf0.in_data_burst_en = 1;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.conf1.in_ext_mem_bk_size = 1;
+                    // GDMA.sram_size[lcd_cam_obj->dma_num].in.in_size = 14; // fifo 128 Bytes
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.peri_sel.sel = 5;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.pri.rx_pri = 1;
+                    // GDMA.channel[lcd_cam_obj->dma_num].in.link.start = 1;
+                    // LCD_CAM.cam_ctrl.cam_update = 1;
+                    // LCD_CAM.cam_ctrl1.cam_start = 1;
+                    
+                }
+            }
+            break;
+        }
+    }
 }
 
 static size_t cam_take(uint8_t **buffer_p)
@@ -699,7 +812,7 @@ static size_t cam_take(uint8_t **buffer_p)
 static void cam_give(uint8_t *dma_buffer)
 {
     for (int x = 0; x < lcd_cam_obj->cam.frame_cnt; x++) {
-        if (&lcd_cam_obj->cam.frame_buffer[x * lcd_cam_obj->cam.recv_size] == dma_buffer) {
+        if (&lcd_cam_obj->cam.frame_buffer[x][0] == dma_buffer) {
             lcd_cam_obj->cam.frame_en[x] = 1;
             break;
         }
@@ -744,6 +857,7 @@ static esp_err_t cam_set_pin(cam_config_t *config)
 
 static esp_err_t cam_dma_config(cam_config_t *config) 
 {
+#if 0
     int cnt = 0;
     if (config->mode.jpeg) {
         lcd_cam_obj->cam.dma_buffer_size = 2048;
@@ -787,6 +901,42 @@ static esp_err_t cam_dma_config(cam_config_t *config)
 
     GDMA.channel[lcd_cam_obj->dma_num].in.link.addr = ((uint32_t)&lcd_cam_obj->cam.dma[0]) & 0xfffff;
     LCD_CAM.cam_ctrl1.cam_rec_data_bytelen = lcd_cam_obj->cam.dma_half_buffer_size - 1; // Ping pong operation
+#endif
+    int x = 0, y = 0, left = 0, cnt = 0;
+    int len = lcd_cam_obj->cam.recv_size * sizeof(uint8_t);
+    if (len % LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE) {
+        cnt = len / LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+        left = len % LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+    } else {
+        cnt = len / LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1;
+        left = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+    }
+    lcd_cam_obj->cam.dma = (lldesc_t **)heap_caps_malloc((lcd_cam_obj->cam.frame_cnt) * sizeof(lldesc_t *), MALLOC_CAP_DMA);
+    lldesc_t **dma_tail = (lldesc_t **)heap_caps_malloc((lcd_cam_obj->cam.frame_cnt) * sizeof(lldesc_t *), MALLOC_CAP_DMA);
+    for (y = 0; y < lcd_cam_obj->cam.frame_cnt; y++) {
+        lcd_cam_obj->cam.dma[y] = (lldesc_t *)heap_caps_malloc((cnt + 1) * sizeof(lldesc_t), MALLOC_CAP_DMA);
+        lldesc_t *dma = lcd_cam_obj->cam.dma[y];
+        for (x = 0; x < cnt; x++) {
+            dma[x].size = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+            dma[x].length = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE;
+            dma[x].buf = (&lcd_cam_obj->cam.frame_buffer[y][0] + LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE * x);
+            dma[x].eof = 0;
+            dma[x].empty = &dma[(x + 1)];
+        }
+        if (left) {
+            dma[x].size = left;
+            dma[x].length = left;
+            dma[x].buf = (&lcd_cam_obj->cam.frame_buffer[y][0] + LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE * x);
+            dma[x].eof = 1;
+            dma[x].empty = NULL;
+            dma_tail[y] = (lldesc_t *)&dma[x];
+        }
+    }
+    for (y = 0; y < lcd_cam_obj->cam.frame_cnt; y++) {
+        dma_tail[y]->empty = lcd_cam_obj->cam.dma[(y+1) % lcd_cam_obj->cam.frame_cnt];
+    }
+
+
     return ESP_OK;
 }
 
@@ -829,6 +979,9 @@ esp_err_t lcd_cam_deinit(lcd_cam_handle_t *handle)
             free(lcd_cam_obj->cam.frame_en);
         }
         if (lcd_cam_obj->cam.frame_buffer) {
+            for (int x = 0; x < lcd_cam_obj->cam.frame_cnt; x++) {
+               free(lcd_cam_obj->cam.frame_buffer[x]); 
+            }
             free(lcd_cam_obj->cam.frame_buffer);
         }
     }
@@ -943,30 +1096,37 @@ esp_err_t lcd_cam_init(lcd_cam_handle_t *handle, lcd_cam_config_t *config)
         lcd_cam_obj->cam.frame_cnt = config->cam.frame_cnt;
         lcd_cam_obj->cam.recv_size = config->cam.recv_size;
         lcd_cam_obj->cam.swap_data = config->cam.swap_data;
-        ret |= cam_set_pin(&config->cam);
-        ret |= cam_dma_config(&config->cam);
-
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "cam config fail!");
-            lcd_cam_deinit(handle);
-            return ESP_FAIL;
-        }
 
         lcd_cam_obj->cam.event_queue = xQueueCreate(2, sizeof(cam_event_t));
         lcd_cam_obj->cam.frame_buffer_queue = xQueueCreate(lcd_cam_obj->cam.frame_cnt, sizeof(frame_buffer_event_t));
-        lcd_cam_obj->cam.frame_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->cam.frame_cnt * lcd_cam_obj->cam.recv_size * sizeof(uint8_t), config->cam.frame_caps);
+        lcd_cam_obj->cam.frame_buffer = (uint8_t **)heap_caps_malloc(lcd_cam_obj->cam.frame_cnt * sizeof(uint8_t *), MALLOC_CAP_DEFAULT);
         lcd_cam_obj->cam.frame_en = (uint8_t *)heap_caps_malloc(lcd_cam_obj->cam.frame_cnt * sizeof(uint8_t), MALLOC_CAP_DEFAULT);
-
-        for (int x = 0; x < lcd_cam_obj->cam.frame_cnt; x++) {
-            lcd_cam_obj->cam.frame_en[x] = 1;
-        }
         xTaskCreate(cam_task, "cam_task", config->cam.task_stack, NULL, config->cam.task_pri, &lcd_cam_obj->cam.task_handle);
-
         if (lcd_cam_obj->cam.event_queue == NULL || \
             lcd_cam_obj->cam.frame_buffer_queue == NULL || \
             lcd_cam_obj->cam.frame_buffer == NULL || \
             lcd_cam_obj->cam.frame_en == NULL || \
             lcd_cam_obj->cam.task_handle == NULL) {
+            ESP_LOGE(TAG, "cam config fail!");
+            lcd_cam_deinit(handle);
+            return ESP_FAIL;
+        }
+
+        for (int x = 0; x < lcd_cam_obj->cam.frame_cnt; x++) {
+            lcd_cam_obj->cam.frame_en[x] = 1;
+            uint8_t * dma_buffer = (uint8_t *)heap_caps_malloc(lcd_cam_obj->cam.recv_size + 0x3F, config->cam.frame_caps); // 保证字节对齐
+            lcd_cam_obj->cam.frame_buffer[x] = (uint8_t *)(((uint32_t)dma_buffer & (~0x3F)) + 0x40); // 64字节对齐
+            if (lcd_cam_obj->cam.frame_buffer[x] == NULL) {
+                ESP_LOGE(TAG, "cam config fail!");
+                lcd_cam_deinit(handle);
+                return ESP_FAIL;
+            }   
+        }
+
+        ret |= cam_set_pin(&config->cam);
+        ret |= cam_dma_config(&config->cam);
+
+        if (ret != ESP_OK) {
             ESP_LOGE(TAG, "cam config fail!");
             lcd_cam_deinit(handle);
             return ESP_FAIL;
