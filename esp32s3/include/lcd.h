@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define LCD_DATA_MAX_WIDTH (16)  /*!< Maximum width of LCD data bus */
-#define LCD_DATA_MAX_FB    (8) 
+#define LCD_DATA_MAX_FB    (8)
 
 typedef struct lcd_handle_struct lcd_handle_t;
 
@@ -67,12 +67,12 @@ typedef struct {
     } video_timing_v;
     union {
         struct {
-            uint32_t video_mode_en:         1;
-            uint32_t frame_buffer_num:      4;
-            uint32_t max_dma_buffer_size:  20; /*!< DMA maximum memory usage, memory must be able to accessed by DMA */
-            uint32_t swap_data:             1; /*!< Two-byte data exchange */
-            uint32_t pix_bytes:             3;
-            uint32_t reserved29:            3; /*reserved*/
+            uint32_t mode_sel:            1; // 0: RGB frame, 1: 8080 copy, 2: 8080 frame
+            uint32_t frame_buffer_num:    4;
+            uint32_t max_cp_buffer_size: 20; /*!< DMA maximum memory usage, memory must be able to accessed by DMA */
+            uint32_t swap_data:           1; /*!< Two-byte data exchange */
+            uint32_t pix_bytes:           3;
+            uint32_t reserved29:          3; /*reserved*/
         };
         uint32_t val;
     } ctr;
@@ -84,6 +84,30 @@ typedef struct {
         };
         uint32_t val;
     } pin_clk;
+    union {
+        struct {
+            uint32_t vsync:        16; /*!< CLK output pin */
+            uint32_t vsync_inv:     1; /*!< CLK output signal inversion */
+            uint32_t reserved17: 15; /*reserved*/
+        };
+        uint32_t val;
+    } pin_vsync;
+    union {
+        struct {
+            uint32_t hsync:        16; /*!< CLK output pin */
+            uint32_t hsync_inv:     1; /*!< CLK output signal inversion */
+            uint32_t reserved17: 15; /*reserved*/
+        };
+        uint32_t val;
+    } pin_hsync;
+    union {
+        struct {
+            uint32_t href:        16; /*!< CLK output pin */
+            uint32_t href_inv:     1; /*!< CLK output signal inversion */
+            uint32_t reserved17: 15; /*reserved*/
+        };
+        uint32_t val;
+    } pin_href;
     union {
         struct {
             uint32_t data:        16; /*!< DATA output pin */
@@ -104,44 +128,47 @@ typedef struct {
  * @brief Structure to store handle information of lcd driver
  */
 typedef struct {
-    struct {
-        struct {
-            esp_err_t (*run)(lcd_handle_t *handle);
-            esp_err_t (*stop)(lcd_handle_t *handle);
-        } ctr;
-
-        struct {
-            void (*write) (int pos);
-        } fb;
-
-        struct {
-            void (*write) (uint8_t *data, size_t len);
-        } data;
-    } s; // slave
 
     struct {
         struct {
-            void (*start)(void *arg);
-            void (*end)(void *arg);
-        } fb;
+            void (*run)(lcd_handle_t *handle);
+            void (*stop)(lcd_handle_t *handle);
+        } slv;
+    } ctr;
 
+    struct {
         struct {
-            void (*start)(void *arg);
-            void (*end)(void *arg);
-        } data;
-    } m; // master
-} lcd_port_t; 
+            void (*start)(lcd_handle_t *handle, void *arg);
+            void (*end)(lcd_handle_t *handle, void *arg);
+        } mst;
+        struct {
+            void (*write)(lcd_handle_t *handle, uint8_t *data, size_t len);
+        } slv;
+    } data;
+
+    struct {
+        struct {
+            void (*start)(lcd_handle_t *handle, void *arg);
+            void (*end)(lcd_handle_t *handle, void *arg);
+        } mst;
+        struct {
+            void (*write)(lcd_handle_t *handle, int pos);
+        } slv;
+    } fb;
+} lcd_port_t;
 
 /**
  * @brief Structure to store handle information of lcd_fb driver
  */
 struct lcd_handle_struct {
+    void *self;
     lcd_ctrl_t *ctrl; // 寄存器
     lcd_port_t *port; // 驱动器
-    void *obj;
 }; /*!< lcd handle */
 
 esp_err_t lcd_create(lcd_handle_t *handle);
+
+esp_err_t lcd_config(lcd_handle_t *handle);
 
 esp_err_t lcd_remove(lcd_handle_t *handle);
 
